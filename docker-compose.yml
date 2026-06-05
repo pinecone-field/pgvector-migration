@@ -1,0 +1,42 @@
+# Local pgvector instance for the migration walkthrough.
+#
+#   docker compose up -d        # start
+#   docker compose down -v      # stop and delete the volume (full cleanup)
+#
+# Connection string used by the notebook:
+#   postgresql://demo:demo@localhost:5432/vectordemo
+#
+# pg_stat_statements is enabled via the command override so the notebook can
+# read server-side QPS. The official pgvector image already ships the `vector`
+# extension; the notebook still runs CREATE EXTENSION to make it explicit.
+services:
+  pgvector:
+    image: pgvector/pgvector:pg17
+    container_name: pgvector-migration
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+      POSTGRES_DB: vectordemo
+    ports:
+      - "5432:5432"
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_preload_libraries=pg_stat_statements"
+      - "-c"
+      - "pg_stat_statements.track=all"
+    volumes:
+      - pgvector_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d vectordemo"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgvector_data:
+
+# Equivalent one-liner (no compose, no pg_stat_statements preload):
+#   docker run -d --name pgvector-migration -p 5432:5432 \
+#     -e POSTGRES_USER=demo -e POSTGRES_PASSWORD=demo -e POSTGRES_DB=vectordemo \
+#     pgvector/pgvector:pg17

@@ -1,0 +1,6 @@
+parquet_export/
+__pycache__/
+.ipynb_checkpoints/
+.venv/
+*.pyc
+.DS_Store

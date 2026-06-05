@@ -1,0 +1,7 @@
+# pgvector -> Pinecone migration walkthrough dependencies
+# Install into the project venv:  pip install -r requirements.txt
+pinecone>=8.1
+psycopg[binary]>=3.2     # Postgres driver (psycopg3); binary wheels avoid a local libpq build
+pgvector>=0.3            # registers the `vector` type adapter for psycopg3
+numpy>=1.26              # synthetic random vectors + metrics math
+pyarrow>=15              # write Parquet files for Pinecone bulk import
