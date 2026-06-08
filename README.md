@@ -24,7 +24,8 @@ and you can roll back instantly by pointing reads back at pgvector.
 5. Create a Pinecone index.
 6. Copy the vectors in (bulk import, recommended — or streaming upsert).
 7. Validate that Pinecone returns the same results as pgvector.
-8. Cut traffic over gradually, with a rollback path.
+8. Keep Pinecone in sync with ongoing inserts, updates, and deletes.
+9. Cut traffic over gradually, with a rollback path.
 
 ---
 
@@ -202,7 +203,7 @@ Two decisions.
 | Sustained high QPS needing predictable latency | **Dedicated read nodes** |
 
 When unsure, **start on-demand.** You can move an index to dedicated read nodes
-later without re-copying any data (Step 10).
+later without re-copying any data (Step 11).
 
 **(b) Namespace layout** — how your tables map into indexes/namespaces:
 
@@ -496,15 +497,209 @@ that were normalized differently — fix before cutting over.
 
 ---
 
-## Step 9 — Cut over safely (keep pgvector running)
+## Step 9 — Keep Pinecone in sync with pgvector (so it stays switch-ready)
+
+The load in Step 7 is a **snapshot taken at one instant**. From that moment until
+you cut over, pgvector keeps changing — new rows, updated vectors, deleted rows.
+You must propagate those changes to Pinecone so it remains a faithful copy that is
+ready to switch to at any time.
+
+Two facts shape every approach:
+
+- **Upserts are idempotent.** Re-sending a record with the same `id` overwrites it.
+  So **inserts and updates are the same operation** — just `upsert`.
+- **Deletes are the hard part.** A "what changed since last time?" query *cannot
+  see a row that was deleted* — the row is simply gone. So you need either an
+  explicit record of deletions, or a periodic full reconciliation.
+
+> **Important — ongoing sync uses the data API, not bulk import.** Bulk import only
+> *adds* data and only into **new** namespaces; it cannot update a live namespace
+> and cannot delete. So trickle updates use `index.upsert` / `index.delete`
+> (below). Reserve bulk import (Step 7a) for the one-time backfill and for periodic
+> **full rebuilds** (import a fresh snapshot into a *new* namespace, validate, then
+> point your app at it and delete the old one — a "namespace swap").
+
+Pick one of the two strategies below. They map directly onto the two ideas of
+"track state in Postgres and anti-join" vs. "keep a change log and apply it."
+
+### Strategy A — Watermark / anti-join in Postgres (simplest)
+
+Best when rows are mostly **inserted** (rarely updated/deleted) and you have a
+monotonic change signal — a serial `id` and/or an `updated_at timestamptz`.
+
+**Pull new and updated rows** since the last run using a high-water mark you store
+somewhere small (a one-row `pinecone_sync_state` table, a file, etc.):
+
+```sql
+-- changed rows since the last sync watermark
+SELECT id, title, category, embedding
+FROM   documents
+WHERE  updated_at > :last_synced_at      -- requires an updated_at on writes
+ORDER  BY updated_at;
+```
+
+Upsert those into Pinecone, then advance the watermark to the max `updated_at` you
+just processed.
+
+**Insert-only variant (your `NOT EXISTS` idea):** if there is no `updated_at`, keep
+a ledger of ids you have already migrated and pull only the ones that are new:
+
+```sql
+-- a tiny ledger table you maintain (one row per migrated record)
+CREATE TABLE pinecone_ledger (table_name text, id text, PRIMARY KEY (table_name, id));
+
+-- rows not yet in Pinecone
+SELECT s.id, s.title, s.category, s.embedding
+FROM   documents s
+WHERE  NOT EXISTS (
+         SELECT 1 FROM pinecone_ledger l
+         WHERE  l.table_name = 'documents' AND l.id = s.id::text);
+```
+
+After upserting them, insert their ids into `pinecone_ledger`.
+
+**Deletes need a reconciliation pass** (a watermark/`NOT EXISTS` can't see them).
+Anti-join the *other* direction — ids you have migrated that no longer exist in the
+source — and delete those from Pinecone:
+
+```sql
+-- ids in the ledger whose source row is gone
+SELECT l.id
+FROM   pinecone_ledger l
+WHERE  l.table_name = 'documents'
+  AND  NOT EXISTS (SELECT 1 FROM documents s WHERE s.id::text = l.id);
+```
+
+```python
+stale = [r[0] for r in conn.execute(
+    """SELECT l.id FROM pinecone_ledger l
+       WHERE l.table_name = 'documents'
+         AND NOT EXISTS (SELECT 1 FROM documents s WHERE s.id::text = l.id)""").fetchall()]
+for i in range(0, len(stale), 1000):
+    index.delete(ids=[f"documents#{rid}" for rid in stale[i:i+1000]], namespace="documents")
+# then remove those ids from pinecone_ledger
+```
+
+*Trade-off:* no triggers or prod schema changes (beyond the optional ledger), but
+updates require an `updated_at`, and deletes require the periodic reconcile.
+
+### Strategy B — Change-log (outbox) table + triggers (captures everything)
+
+Best when **updates and deletes matter**. A trigger records every change to an
+outbox table; a worker drains it and applies upserts/deletes to Pinecone. This is
+the classic, dependency-free change-data-capture (CDC) pattern.
+
+**1) Create the change-log and triggers** (a one-time DDL on your database — small
+per-write overhead; coordinate with your DBA):
+
+```sql
+CREATE TABLE pinecone_changelog (
+    seq        bigserial PRIMARY KEY,
+    table_name text        NOT NULL,
+    row_id     text        NOT NULL,
+    op         text        NOT NULL CHECK (op IN ('upsert', 'delete')),
+    changed_at timestamptz NOT NULL DEFAULT now(),
+    processed  boolean     NOT NULL DEFAULT false
+);
+
+CREATE OR REPLACE FUNCTION log_pinecone_change() RETURNS trigger AS $$
+BEGIN
+  IF (TG_OP = 'DELETE') THEN
+    INSERT INTO pinecone_changelog(table_name, row_id, op)
+      VALUES (TG_TABLE_NAME, OLD.id::text, 'delete');
+    RETURN OLD;
+  ELSE
+    INSERT INTO pinecone_changelog(table_name, row_id, op)
+      VALUES (TG_TABLE_NAME, NEW.id::text, 'upsert');
+    RETURN NEW;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_pinecone_documents
+  AFTER INSERT OR UPDATE OR DELETE ON documents
+  FOR EACH ROW EXECUTE FUNCTION log_pinecone_change();
+-- repeat the trigger for each migrated table
+```
+
+**2) Drain the change-log on a schedule.** Collapse to the latest op per row (so an
+insert-then-delete nets to a delete, repeated updates collapse to one upsert),
+apply deletes and upserts, then mark the rows processed:
+
+```python
+from collections import defaultdict
+
+# Snapshot the frontier first so rows arriving mid-run aren't marked done.
+max_seq = conn.execute(
+    "SELECT COALESCE(max(seq), 0) FROM pinecone_changelog WHERE NOT processed"
+).fetchone()[0]
+
+# Latest op per (table, row) up to the frontier.
+changes = conn.execute("""
+    SELECT DISTINCT ON (table_name, row_id) table_name, row_id, op
+    FROM   pinecone_changelog
+    WHERE  NOT processed AND seq <= %s
+    ORDER  BY table_name, row_id, seq DESC
+""", (max_seq,)).fetchall()
+
+upserts, deletes = defaultdict(list), defaultdict(list)
+for table, row_id, op in changes:
+    (upserts if op == "upsert" else deletes)[table].append(row_id)
+
+# Deletes: just send the ids.
+for table, ids in deletes.items():
+    for i in range(0, len(ids), 1000):
+        index.delete(ids=[f"{table}#{r}" for r in ids[i:i+1000]], namespace=table)
+
+# Upserts: re-read current row data from the source, then upsert (idempotent).
+for table, ids in upserts.items():
+    cfg = TABLES[table]
+    cols = ", ".join([cfg["id"]] + cfg["metadata"] + [cfg["vector"]])
+    fresh = conn.execute(
+        f"SELECT {cols} FROM {table} WHERE {cfg['id']}::text = ANY(%s)", (ids,)
+    ).fetchall()
+    records = [build_record(table, r, cfg) for r in fresh]
+    for i in range(0, len(records), 200):
+        index.upsert(vectors=records[i:i+200], namespace=table)
+
+conn.execute(
+    "UPDATE pinecone_changelog SET processed = true WHERE NOT processed AND seq <= %s",
+    (max_seq,))
+```
+
+*The Parquet variant of this:* for a large batch of upserts you can write the
+changed rows to Parquet and **rebuild** into a new namespace (then swap), but
+deletes always go through `index.delete` — they can't be expressed in an import
+file. For high write volumes, replace the triggers with Postgres **logical
+replication / Debezium** to stream changes from the WAL instead.
+
+### Reconciliation safety net (recommended for either strategy)
+
+Periodically prove the two stores agree by diffing ids. `index.list` pages through
+every id in a namespace:
+
+```python
+pg_ids = {f"documents#{r[0]}" for r in conn.execute("SELECT id FROM documents")}
+pc_ids = set()
+for id_batch in index.list(namespace="documents"):   # yields lists of ids
+    pc_ids.update(id_batch)
+
+missing_in_pinecone = pg_ids - pc_ids   # -> upsert these
+stale_in_pinecone   = pc_ids - pg_ids   # -> index.delete these
+print(len(missing_in_pinecone), "to add;", len(stale_in_pinecone), "to delete")
+```
+
+Run this nightly (or before cutover). In steady state both sets should be empty;
+anything else flags a sync gap to fix before you switch.
+
+## Step 10 — Cut over safely (keep pgvector running)
 
 Your pgvector database stays in charge until Pinecone has earned the traffic. Do
 this gradually:
 
-1. **Keep both in sync.** The import in Step 7 is a one-time snapshot. From now on,
-   have your application **write new and updated vectors to *both* pgvector and
-   Pinecone** (dual-write), or re-run the import on a schedule. Otherwise Pinecone
-   drifts out of date.
+1. **Keep both in sync.** Make sure the continuous sync from **Step 9** is running,
+   so Pinecone reflects every insert, update, and delete from pgvector. Otherwise it
+   drifts out of date and the cutover is unsafe.
 2. **Shadow reads.** Send a copy of some live read traffic to Pinecone *without*
    using its results yet. Compare results and latency to pgvector. Fix any gaps.
 3. **Canary.** Route a small percentage of real reads (say 1%, then 10%) to
@@ -519,7 +714,7 @@ as primary, no incidents, and no reason to roll back. There is no rush.
 
 ---
 
-## Step 10 — (Optional) tune capacity later
+## Step 11 — (Optional) tune capacity later
 
 Once you know your real query rate, you can move an on-demand index to **dedicated
 read nodes** *in place* — no data is re-copied:
@@ -564,6 +759,8 @@ hour for as long as they exist, so delete any index you created only for testing
 | Get a data handle | `index = pc.Index(name)` |
 | Bulk import | `index.start_import(uri=..., integration_id=..., error_mode="CONTINUE")` |
 | Stream upsert | `index.upsert(vectors=[(id, values, metadata), ...], namespace=ns)` |
+| Delete records | `index.delete(ids=[...], namespace=ns)` |
+| List ids (reconcile) | `index.list(namespace=ns)` |
 | Search | `index.query(vector=q, top_k=k, namespace=ns, filter={...})` |
 | Check counts | `index.describe_index_stats()` |
 | Go dedicated | `pc.configure_index(name, read_capacity={...})` |
