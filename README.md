@@ -522,6 +522,33 @@ Two facts shape every approach:
 Pick one of the two strategies below. They map directly onto the two ideas of
 "track state in Postgres and anti-join" vs. "keep a change log and apply it."
 
+### Runnable implementation: `sync.py`
+
+This repo includes **`sync.py`**, which implements *both* strategies below and is
+tested end-to-end (initial load → insert/update/delete → verify in Pinecone). Edit
+the `TABLES` config at the top of the file, set `PG_CONN`, `PINECONE_API_KEY`, and
+`PINECONE_INDEX`, then:
+
+```bash
+# Strategy B — change-log + triggers (captures inserts, updates, AND deletes)
+python sync.py init     --strategy changelog   # one-time: create the outbox + triggers
+python sync.py backfill                         # one-time: load existing rows
+python sync.py sync     --strategy changelog    # run on a schedule (e.g. cron)
+
+# Strategy A — watermark / anti-join
+python sync.py init     --strategy watermark
+python sync.py sync     --strategy watermark    # the first run also backfills
+
+python sync.py reconcile                        # id-diff safety net (either strategy)
+```
+
+Create the triggers (`init`) **before** the `backfill` so any change made during
+the backfill is captured and re-applied (upserts are idempotent). Unlike the
+read-only migration, `sync.py` needs **write** access for its bookkeeping (the
+ledger/state tables for A, or the change-log table + triggers for B).
+
+The two sections below explain what each strategy does under the hood.
+
 ### Strategy A — Watermark / anti-join in Postgres (simplest)
 
 Best when rows are mostly **inserted** (rarely updated/deleted) and you have a
@@ -694,9 +721,6 @@ anything else flags a sync gap to fix before you switch.
 
 ## Step 10 — Cut over safely (keep pgvector running)
 
-Your pgvector database stays in charge until Pinecone has earned the traffic. Do
-this gradually:
-
 1. **Keep both in sync.** Make sure the continuous sync from **Step 9** is running,
    so Pinecone reflects every insert, update, and delete from pgvector. Otherwise it
    drifts out of date and the cutover is unsafe.
@@ -708,9 +732,6 @@ this gradually:
    make Pinecone the primary read path. **Keep pgvector running as a fallback.**
 5. **Rollback is trivial.** If anything looks wrong at any stage, point reads back
    to pgvector — it never stopped serving and is still authoritative.
-
-**Decommission pgvector only much later** — after a sustained period with Pinecone
-as primary, no incidents, and no reason to roll back. There is no rush.
 
 ---
 
