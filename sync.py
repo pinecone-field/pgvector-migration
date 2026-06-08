@@ -42,7 +42,12 @@ from pgvector.psycopg import register_vector
 from pinecone import Pinecone
 
 # ---------------------------------------------------------------------------
-# Configuration — edit to match your schema.
+# Configuration — EDIT THIS to match your schema.
+#
+# The entries below are the DEMO shape: they match the tables created by
+# migration_walkthrough.ipynb (documents/products/images), so sync.py runs
+# against the demo out of the box. For a real migration, replace them with your
+# own tables. Each entry:
 #   id:         primary-key column (used to build the Pinecone record id)
 #   vector:     the vector(N) column
 #   metadata:   non-vector columns to carry into Pinecone metadata
@@ -98,11 +103,15 @@ def upsert_records(index, table, records):
         index.upsert(vectors=records[i:i + UPSERT_BATCH], namespace=table)
 
 
+def delete_ids(index, namespace, ids):
+    """Delete a list of full Pinecone ids, in batches."""
+    for i in range(0, len(ids), DELETE_BATCH):
+        index.delete(ids=ids[i:i + DELETE_BATCH], namespace=namespace)
+
+
 def delete_row_ids(index, table, row_ids):
-    """Delete by raw source ids (prefixed here)."""
-    for i in range(0, len(row_ids), DELETE_BATCH):
-        ids = [f"{table}#{r}" for r in row_ids[i:i + DELETE_BATCH]]
-        index.delete(ids=ids, namespace=table)
+    """Delete by raw source ids (prefixed with the table name)."""
+    delete_ids(index, table, [f"{table}#{r}" for r in row_ids])
 
 
 def fetch_records(conn, table, cfg, row_ids):
@@ -282,8 +291,7 @@ def reconcile(conn, index):
             raw_ids = [m.split("#", 1)[1] for m in missing]
             upsert_records(index, table, fetch_records(conn, table, cfg, raw_ids))
         if stale:
-            for i in range(0, len(stale := list(stale)), DELETE_BATCH):
-                index.delete(ids=stale[i:i + DELETE_BATCH], namespace=table)
+            delete_ids(index, table, list(stale))
         print(f"reconcile {table}: +{len(missing)} upserted, -{len(stale)} deleted")
 
 
