@@ -52,14 +52,19 @@ from pinecone import Pinecone
 #   vector:     the vector(N) column
 #   metadata:   non-vector columns to carry into Pinecone metadata
 #   updated_at: timestamp column bumped on every write (strategy A only; or None)
+#
+# The demo tables have no updated_at column, so it is None here: the watermark
+# strategy then syncs new rows via the ledger and removals via the anti-join, but
+# not in-place updates. Add an updated_at column (and use changelog for the demo,
+# which captures updates regardless) if you need update detection.
 # ---------------------------------------------------------------------------
 TABLES = {
     "documents": {"id": "id", "vector": "embedding",
-                  "metadata": ["title", "category"], "updated_at": "updated_at"},
+                  "metadata": ["title", "category"], "updated_at": None},
     "products":  {"id": "id", "vector": "embedding",
-                  "metadata": ["name", "price"], "updated_at": "updated_at"},
+                  "metadata": ["name", "price"], "updated_at": None},
     "images":    {"id": "id", "vector": "embedding",
-                  "metadata": ["caption", "source"], "updated_at": "updated_at"},
+                  "metadata": ["caption", "source"], "updated_at": None},
 }
 
 UPSERT_BATCH = 200    # vectors per upsert (2 MB request limit binds for 768-dim)
@@ -282,8 +287,10 @@ def reconcile(conn, index):
         pg_ids = {f"{table}#{r[0]}" for r in
                   conn.execute(f"SELECT {cfg['id']} FROM {table}").fetchall()}
         pc_ids = set()
-        for id_batch in index.list(namespace=table):     # generator of id lists
-            pc_ids.update(id_batch)
+        for id_batch in index.list(namespace=table):     # pages of ids
+            # index.list yields ListItem objects (.id) in pinecone>=9; older
+            # versions yielded plain id strings. getattr handles both.
+            pc_ids.update(getattr(i, "id", i) for i in id_batch)
 
         missing = pg_ids - pc_ids        # in pgvector, not Pinecone -> upsert
         stale = pc_ids - pg_ids          # in Pinecone, not pgvector -> delete

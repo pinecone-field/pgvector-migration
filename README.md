@@ -826,8 +826,8 @@ every id in a namespace:
 ```python
 pg_ids = {f"documents#{r[0]}" for r in conn.execute("SELECT id FROM documents")}
 pc_ids = set()
-for id_batch in index.list(namespace="documents"):   # yields lists of ids
-    pc_ids.update(id_batch)
+for id_batch in index.list(namespace="documents"):   # yields pages of ListItem objects
+    pc_ids.update(i.id for i in id_batch)             # i.id is the record id string
 
 missing_in_pinecone = pg_ids - pc_ids   # -> upsert these
 stale_in_pinecone   = pc_ids - pg_ids   # -> index.delete these
