@@ -18,14 +18,15 @@ and you can roll back instantly by pointing reads back at pgvector.
 ### What you will do
 
 1. Set up a workstation and connect to your database **read-only**.
-2. Discover which tables/columns hold vectors, and their dimension and metric.
-3. Measure the workload (row counts, sizes, query rate).
-4. Choose how to lay the data out in Pinecone.
-5. Create a Pinecone index.
-6. Copy the vectors in (bulk import, recommended — or streaming upsert).
-7. Validate that Pinecone returns the same results as pgvector.
-8. Keep Pinecone in sync with ongoing inserts, updates, and deletes.
-9. Cut traffic over gradually, with a rollback path.
+2. If you use **Row-Level Security**, classify each policy and decide how to enforce it in Pinecone.
+3. Discover which tables/columns hold vectors, and their dimension and metric.
+4. Measure the workload (row counts, sizes, query rate).
+5. Choose how to lay the data out in Pinecone.
+6. Create a Pinecone index.
+7. Copy the vectors in (bulk import, recommended — or streaming upsert).
+8. Validate that Pinecone returns the same results as pgvector.
+9. Keep Pinecone in sync with ongoing inserts, updates, and deletes.
+10. Cut traffic over gradually, with a rollback path.
 
 ---
 
@@ -43,6 +44,7 @@ If you are new to Pinecone, read this once. It makes the rest obvious.
 | The HNSW/IVFFlat index **you build and tune** | Managed automatically | Nothing to build or tune. |
 | Read replicas / sharding **you operate** | **On-demand** autoscaling, or **dedicated read nodes** | You pick; no servers to run. |
 | A separate table or schema **per tenant** | **One namespace per tenant** in a single index | Namespaces partition data inside one index. |
+| A **Row-Level Security policy** (`CREATE POLICY ... USING`) | A **namespace per principal**, or a **metadata filter injected server-side** | Pinecone has no RLS. The filter is *not* a security boundary — see [Access control](#access-control--map-row-level-security-before-you-choose-a-layout). |
 
 Two definitions you will see throughout:
 
@@ -110,6 +112,122 @@ print(conn.execute("SELECT version();").fetchone()[0])
 
 If that prints your Postgres version, you are connected. Keep this `conn` open;
 later steps reuse it.
+
+> **If your tables use Row-Level Security (RLS), read the next section first.**
+> The `pinecone_migration` role above reads rows the way a table *owner* does —
+> RLS policies are **not** applied to it — so the migration copies **every** row,
+> across every tenant, regardless of who could see it in your app. That is fine
+> (you want a complete copy), but it means the access rules RLS enforced in
+> Postgres must be re-created on the Pinecone side *before* you choose a layout.
+
+---
+
+## Access control — map Row-Level Security before you choose a layout
+
+Skip this section if you do **not** use Postgres [Row-Level Security][rls]. If you
+do, decide how each policy will be enforced in Pinecone now, because the answer
+changes your layout (Step 5) and your record mapping (Step 6).
+
+**Why it can't just carry over.** An RLS policy is arbitrary SQL evaluated by the
+database on every query (`USING (tenant_id = current_setting('app.tenant_id'))`).
+Pinecone has nothing equivalent: a query either targets a **namespace** or carries
+a **metadata filter**, and a filter is a flat predicate over scalar fields stored
+on each record. It supports only these operators:
+
+| Operator | Meaning |
+|---|---|
+| `$eq` / `$ne` | equal / not equal |
+| `$gt` / `$gte` / `$lt` / `$lte` | numeric comparison |
+| `$in` / `$nin` | set membership / exclusion |
+| `$and` / `$or` | combine conditions |
+
+No joins, no subqueries, no `current_user`, no functions. So a policy maps cleanly
+only when it is *"a predicate over columns I can copy onto the record and compare
+against a value the server knows at query time."*
+
+### Step A — list your policies and classify them
+
+```sql
+-- Every policy on the tables you intend to migrate:
+SELECT schemaname, tablename, policyname, cmd, qual
+FROM   pg_policies
+WHERE  schemaname = 'public'
+ORDER  BY tablename, policyname;
+
+-- And which tables actually have RLS enabled:
+SELECT relname, relrowsecurity, relforcerowsecurity
+FROM   pg_class
+WHERE  relrowsecurity = true;
+```
+
+Read the `qual` (the `USING` expression) of each policy and sort it into one of
+four buckets:
+
+| Policy shape (`USING ...`) | Maps to | How |
+|---|---|---|
+| `tenant_id = current_setting('app.tenant_id')` | **Namespace** (preferred) or `$eq` filter | One namespace per tenant, *or* `filter={"tenant_id": {"$eq": <tenant>}}` |
+| `visibility IN ('public', current_role)` | `$in` filter | Copy `visibility` to metadata; `filter={"visibility": {"$in": ["public", <role>]}}` |
+| `region = ... AND status = 'active'` | `$and` of `$eq` filters | Copy both columns to metadata; combine with `$and` |
+| Row carries an ACL list (`allowed_groups text[]`) | list metadata + `$in` | Store `allowed_groups` as a list field; `filter={"allowed_groups": {"$in": [<caller's groups>]}}` |
+| `EXISTS (SELECT 1 FROM memberships m WHERE ...)` — **joins another table** | **denormalize**, then filter | Flatten the membership onto each record at copy time, then filter on it (see the gotcha below) |
+| References a function, or data not on the row | **does not map** | Keep the access decision in your application; gate which records you query/return |
+
+### Step B — pick the enforcement mechanism
+
+**For plain tenant isolation, prefer a namespace per tenant** over a metadata
+filter. The data is physically partitioned, the query targets one namespace chosen
+from the authenticated session, and a *forgotten* filter can't silently leak across
+tenants — you would have to query the wrong namespace, which is a louder, more
+obvious bug. Reach for a metadata filter instead when:
+
+- you have too many / too-small tenants for a namespace each,
+- the rule is **finer than a tenant** (per-document ACLs), or
+- you legitimately need to query across tenants sometimes.
+
+A common hybrid: **namespace = the hard tenant boundary, metadata filter = the
+finer ACL within the tenant.**
+
+### Step C — enforce the filter server-side (the part that actually matters)
+
+RLS is enforced *by the database engine* — a buggy or compromised query still
+cannot see another tenant's rows. **A Pinecone metadata filter is the opposite
+default: omit it and you get everything.** It recreates the *effect* of RLS, not
+its *enforcement*. It is safe only if:
+
+- the tenant/principal value is derived **server-side from the authenticated
+  session** — never accepted from the client, where it could be spoofed, and
+- the filter is applied **unconditionally** on every query.
+
+```python
+# GOOD — the boundary is chosen from the verified session, not the request body.
+def search(session, query_vector, k=10):
+    tenant = session.tenant_id                       # from your auth layer, trusted
+    return index.query(
+        vector=query_vector,
+        top_k=k,
+        namespace=tenant,                            # hard boundary, or:
+        filter={"tenant_id": {"$eq": tenant}},       # ...soft boundary — still server-set
+    )
+
+# BAD — caller controls the boundary; this is not isolation.
+#   filter = request.json["filter"]                  # spoofable
+#   index.query(vector=qvec, top_k=k, filter=filter)
+```
+
+Wrap this in a single query function that *all* reads go through, so no call site
+can forget the filter or the namespace.
+
+> **Gotcha — permission changes can go stale.** If you enforce access with
+> *denormalized* metadata (an `allowed_groups` list, a membership flag copied onto
+> the record), then a `GRANT`/`REVOKE` happens in a **different table** than the
+> vector rows. The sync in [Step 9](#step-9--keep-pinecone-in-sync-with-pgvector-so-it-stays-switch-ready)
+> is driven by changes to the *data* tables (its `updated_at` watermark and its
+> per-table triggers), so a membership change won't trigger a re-upsert and
+> Pinecone keeps serving the **old** ACL. If you go this route, add triggers on the
+> permission tables that enqueue the affected record ids, or re-run `reconcile`
+> after permission changes.
+
+[rls]: https://www.postgresql.org/docs/current/ddl-rowsecurity.html
 
 ---
 
@@ -774,6 +892,7 @@ hour for as long as they exist, so delete any index you created only for testing
 
 | Task | Command |
 |---|---|
+| Audit RLS policies | `SELECT * FROM pg_policies WHERE schemaname='public';` (Access control) |
 | Find vector columns | `pg_attribute` query in Step 2 |
 | Count vectors | `SELECT count(*) FROM t;` |
 | Create index | `pc.create_index(name, dimension, metric, spec=ServerlessSpec(...))` |
