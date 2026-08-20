@@ -362,7 +362,10 @@ Pick a region close to your application. Dimension and metric come from Step 2.
 import os
 from pinecone import Pinecone, ServerlessSpec
 
-pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+pc = Pinecone(
+    api_key=os.environ["PINECONE_API_KEY"],
+    source_tag="pinecone_field:pgvector_migration",
+)
 
 INDEX_NAME = "my-app"        # lowercase letters, numbers, hyphens
 DIMENSION  = 768             # from Step 2 — must match your vectors exactly

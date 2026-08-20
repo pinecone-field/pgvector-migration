@@ -81,7 +81,10 @@ def connect():
 
 
 def get_index():
-    pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+    pc = Pinecone(
+        api_key=os.environ["PINECONE_API_KEY"],
+        source_tag="pinecone_field:pgvector_migration",
+    )
     return pc.Index(os.environ.get("PINECONE_INDEX", "pg-sync"))
 
 
