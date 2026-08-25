@@ -439,7 +439,8 @@ def build_record(table, row, cfg):
         if isinstance(value, Decimal):
             value = float(value)                   # JSON/metadata can't hold Decimal
         metadata[name] = value
-    return (f"{table}#{row_id}", vector.tolist(), metadata)
+    values = vector.tolist() if hasattr(vector, "tolist") else vector.to_list()
+    return (f"{table}#{row_id}", values, metadata)
 
 def select_sql(table, cfg):
     cols = ", ".join([cfg["id"]] + cfg["metadata"] + [cfg["vector"]])
